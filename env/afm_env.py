@@ -134,6 +134,12 @@ class AfmEnvironment(gym.Env):
         # TODO: Shift optimal height upwards?
         self.optimal_height = gaussian_filter(self.min_image, sigma=sigma) + self.height_offset_reward
 
+        self._z_map_start = self.z_height_map[0]
+        self._z_map_step = self.z_height_map[1] - self.z_height_map[0]
+        self._z_map_len_minus_1 = len(self.z_height_map) - 1
+        self._x_lim = self.afm_images.shape[0]
+        self._y_lim = self.afm_images.shape[1]
+
         # Define observation space
         x_px_max, y_px_max, _ = self.afm_images.shape
 
@@ -310,42 +316,76 @@ class AfmEnvironment(gym.Env):
         if self.terminated:
             return self._get_obs(), 0, True, False, self._get_info()
 
-        x_px_max, y_px_max, _ = self.afm_images.shape
-        x_current, y_current = int(self._x[0]), int(self._y[0])
+        x_lim = self._x_lim
+        y_lim = self._y_lim
+
+        # We shift all history arrays now (x, y, dz, df)
+        self._x[1:] = self._x[:-1]
+        self._y[1:] = self._y[:-1]
+        self._dz[1:] = self._dz[:-1]
+        self._df[1:] = self._df[:-1]
+
+        x_current, y_current = int(self._x[1]), int(self._y[1])
 
         # Determine new position based on raster scan pattern
         if y_current % 2 == 0:  # Even rows: moving right
-            if x_current + 1 >= x_px_max:
+            if x_current + 1 >= x_lim:
                 # End of row reached, move to next row
-                self._x = self._insert_into_array(self._x, x_current)
-                self._y = self._insert_into_array(self._y, y_current + 1)
+                x_new = x_current
+                y_new = y_current + 1
             else:
                 # Move right
-                self._x = self._insert_into_array(self._x, x_current + 1)
-                self._y = self._insert_into_array(self._y, y_current)
+                x_new = x_current + 1
+                y_new = y_current
         else:  # Odd rows: moving left
             if x_current - 1 < 0:
                 # Beginning of row reached, move to next row
-                self._x = self._insert_into_array(self._x, x_current)
-                self._y = self._insert_into_array(self._y, y_current + 1)
+                x_new = x_current
+                y_new = y_current + 1
             else:
                 # Move left
-                self._x = self._insert_into_array(self._x, x_current - 1)
-                self._y = self._insert_into_array(self._y, y_current)
+                x_new = x_current - 1
+                y_new = y_current
 
-        x_new, y_new = int(self._x[0]), int(self._y[0])
+        self._x[0] = x_new
+        self._y[0] = y_new
 
         # Update dz and df
         # TODO: Clip z
         if self.num_actions > 1:
             continuous_action = self._action_map[action]
-            dz_new = self._dz[0] + continuous_action
+            dz_new = self._dz[1] + continuous_action
         else:
-            dz_new = self._dz[0] + action[0]
-        self._dz = self._insert_into_array(self._dz, dz_new)
+            dz_new = self._dz[1] + action[0]
+
+        self._dz[0] = dz_new
         z_new = self.z_start + dz_new
-        self._df = self._insert_into_array(self._df, self._get_interpolated_df(x_new, y_new, z_new))
-        self.generated_image[x_new, y_new] = self._df[0]
+
+
+        # Calculate float index in the z_map
+        idx_float = (z_new - self._z_map_start) / self._z_map_step
+
+        # Floor to get lower index and clamp
+        idx_1 = int(idx_float)
+        if idx_1 < 0:
+            idx_1 = 0
+            idx_2 = 0
+            fraction = 0.0
+        elif idx_1 >= self._z_map_len_minus_1:
+            idx_1 = self._z_map_len_minus_1
+            idx_2 = self._z_map_len_minus_1
+            fraction = 0.0
+        else:
+            idx_2 = idx_1 + 1
+            fraction = idx_float - idx_1
+
+        # Interpolate
+        v1 = self.afm_images[x_new, y_new, idx_1]
+        v2 = self.afm_images[x_new, y_new, idx_2]
+        df_new = v1 + fraction * (v2 - v1)
+
+        self._df[0] = df_new
+        self.generated_image[x_new, y_new] = df_new
 
         # Check for crashes
         # TODO: Add tolerance?
@@ -355,9 +395,11 @@ class AfmEnvironment(gym.Env):
         # TODO: Base reward should be set by variable
         reward = 10 - (z_new - self.optimal_height[x_new, y_new])
 
-        if y_new % 2 == 0 and y_new == y_px_max - 1 and x_new == x_px_max - 1:
-            self.terminated = True
-        elif y_new % 2 == 1 and y_new == 0 and x_new == 0:
-            self.terminated = True
+        # Termination check
+        if y_new == y_lim - 1:  # Check last row
+            if y_new % 2 == 0 and x_new == x_lim - 1:
+                self.terminated = True
+            elif y_new % 2 == 1 and x_new == 0:
+                self.terminated = True
 
         return self._get_obs(), reward, self.terminated, False, self._get_info()
