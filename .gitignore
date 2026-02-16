@@ -1,2 +1,9 @@
 output/*
 afm_images/*
+
+tensorboard_logs*
+models
+train_results
+environments
+logs
+eval_results
