@@ -3,6 +3,7 @@ from typing import Literal, Any, SupportsFloat
 from ppafm.io import loadXYZ
 from ppafm.ocl.AFMulator import AFMulator
 from ppafm.ocl.oclUtils import init_env
+from ppafm.common import PpafmParameters
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 from scipy.signal import argrelextrema
@@ -15,7 +16,8 @@ import os
 class AfmEnvironment(gym.Env):
     metadata = {'render.modes': ['human', 'rgb_array']}
 
-    def _compute_imgs(self, surface_path: str, params_path: str, i_platform: int = 0) -> tuple[AFMulator, np.ndarray]:
+    def _compute_imgs(self, surface_path: str, params_path: str, i_platform: int = 0,
+                      angle_deg: float = 0.0, tx: float = 0.0, ty: float = 0.0) -> tuple[AFMulator, np.ndarray]:
         """
         Generates AFM images with ppafm
 
@@ -36,8 +38,37 @@ class AfmEnvironment(gym.Env):
             Generated images. The second and third axis are already reversed.
         """
         init_env(i_platform=i_platform)
+
+        parameters = PpafmParameters.from_file(params_path)
+
         xyzs, Zs, qs, _ = loadXYZ(surface_path)
-        afmulator = AFMulator.from_params(params_path)
+
+        theta = np.radians(angle_deg)
+        c, s = np.cos(theta), np.sin(theta)
+
+        Rz = np.array([
+            [c, -s, 0],
+            [s, c, 0],
+            [0, 0, 1]
+        ])
+
+        translation = np.array([tx, ty, 0.0])
+
+        xyzs = np.dot(xyzs, Rz.T) + translation
+
+        gridA = np.dot(Rz, parameters.gridA).tolist()
+        gridB = np.dot(Rz, parameters.gridB).tolist()
+        gridC = np.dot(Rz, parameters.gridC).tolist()
+
+        parameters.gridA = gridA
+        parameters.gridB = gridB
+        parameters.gridC = gridC
+
+        new_params_path = params_path.replace(".ini", "_displaced.toml")
+
+        parameters.to_file(new_params_path)
+
+        afmulator = AFMulator.from_params(new_params_path)
         afm_images = afmulator(xyzs, Zs, qs)
 
         return afmulator, afm_images[:, ::-1, ::-1]
@@ -71,7 +102,10 @@ class AfmEnvironment(gym.Env):
                  height_offset_reward=0.3,
                  num_actions=1,
                  render_mode: Literal[None, 'human', 'rgb'] = None,
-                 norm_margin: float = 0.5  # Margin in Angstroms for normalization masking
+                 norm_margin: float = 0.5,  # Margin in Angstroms for normalization masking
+                 angle_deg: float = 0.0,
+                 tx: float = 0.0,
+                 ty: float = 0.0
                  ) -> None:
         """
         Constructor
@@ -104,7 +138,7 @@ class AfmEnvironment(gym.Env):
                 raise ValueError("Must provide surface_path and params_path if data_file_path is missing.")
 
             # Generate images
-            afmulator, self.afm_images = self._compute_imgs(surface_path, params_path, i_platform)
+            afmulator, self.afm_images = self._compute_imgs(surface_path, params_path, i_platform, angle_deg, tx, ty)
 
             # Calculate heights for each slice
             self.z_height_map = np.linspace(
