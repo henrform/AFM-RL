@@ -71,7 +71,7 @@ class AfmEnvironment(gym.Env):
         afmulator = AFMulator.from_params(new_params_path)
         afm_images = afmulator(xyzs, Zs, qs)
 
-        return afmulator, afm_images[:, ::-1, ::-1]
+        return afmulator, afm_images[:, ::-1, ::-1].astype(np.float16)
 
     def save_to_file(self, path: str):
         """
@@ -86,8 +86,8 @@ class AfmEnvironment(gym.Env):
         os.makedirs(path, exist_ok=True)
         for i, view in enumerate(self.views):
             np.savez(
-                os.path.join(path, f"view_{i:03d}.npz"),
-                afm_images=view['afm_images'],
+                os.path.join(path, f"view_{i:05d}.npz"),
+                afm_images=view['afm_images'].astype(np.float32),
                 z_height_map=view['z_height_map'],
                 min_image=view['min_image'],
                 z_bounds=np.array([view['z_min'], view['z_max']])
@@ -106,6 +106,8 @@ class AfmEnvironment(gym.Env):
                  num_actions=1,
                  render_mode: Literal[None, 'human', 'rgb'] = None,
                  norm_margin: float = 0.5,  # Margin in Angstroms for normalization masking
+                 df_scale: float = 10.0,  # Divisor for df observations (physical units)
+                 dz_scale: float = 10.0,  # Divisor for dz observations (physical units)
                  scan_params: list[dict] | None = None,
                  ) -> None:
         """
@@ -138,6 +140,8 @@ class AfmEnvironment(gym.Env):
         self.height_offset_reward = height_offset_reward
         self.num_actions = num_actions
         self.sigma = sigma
+        self.df_scale = df_scale
+        self.dz_scale = dz_scale
 
         # --- Load or compute all views ---
         self.views = []
@@ -151,12 +155,12 @@ class AfmEnvironment(gym.Env):
             if not view_files:
                 raise ValueError(f"No view_*.npz files found in {data_dir_path}")
             for vf in view_files:
-                data = np.load(os.path.join(data_dir_path, vf))
+                data = np.load(os.path.join(data_dir_path, vf), mmap_mode='r')
                 self.views.append(self._build_view_from_data(data, sigma))
 
         elif data_file_path and os.path.exists(data_file_path):
             # Legacy: single .npz file loaded as one view
-            data = np.load(data_file_path)
+            data = np.load(data_file_path, mmap_mode='r')
             self.views.append(self._build_view_from_data(data, sigma))
 
         else:
@@ -233,8 +237,8 @@ class AfmEnvironment(gym.Env):
             {
                 "x": gym.spaces.Box(-1.0, 1.0, shape=(num_historic_data,), dtype=np.float32),
                 "y": gym.spaces.Box(-1.0, 1.0, shape=(num_historic_data,), dtype=np.float32),
-                "dz": gym.spaces.Box(-1.0, 1.0, shape=(num_historic_data,), dtype=np.float32),
-                "df": gym.spaces.Box(-1.0, 1.0, shape=(num_historic_data,), dtype=np.float32),
+                "dz": gym.spaces.Box(-np.inf, np.inf, shape=(num_historic_data,), dtype=np.float32),
+                "df": gym.spaces.Box(-np.inf, np.inf, shape=(num_historic_data,), dtype=np.float32),
             }
         )
 
@@ -252,7 +256,7 @@ class AfmEnvironment(gym.Env):
         """
         Build a view dict from a loaded .npz data file.
         """
-        afm_images = data['afm_images']
+        afm_images = data['afm_images'].astype(np.float16)
         z_height_map = data['z_height_map']
         min_image = data['min_image']
         z_min, z_max = data['z_bounds']
@@ -280,6 +284,7 @@ class AfmEnvironment(gym.Env):
         afmulator, afm_images = self._compute_imgs(
             surface_path, params_path, i_platform, angle_deg, tx, ty
         )
+        afm_images = afm_images.astype(np.float16)
 
         z_height_map = np.linspace(
             afmulator.scan_window[0][2],
@@ -414,8 +419,8 @@ class AfmEnvironment(gym.Env):
         return {
             "x": self._normalize(self._x, 'x').astype(np.float32),
             "y": self._normalize(self._y, 'y').astype(np.float32),
-            "dz": self._normalize(self._dz, 'dz').astype(np.float32),
-            "df": self._normalize(self._df, 'df').astype(np.float32)
+            "dz": (self._dz / self.dz_scale).astype(np.float32),
+            "df": (self._df / self.df_scale).astype(np.float32)
         }
 
     def _get_info(self):
@@ -592,12 +597,34 @@ class AfmEnvironment(gym.Env):
 
         # Check for crashes
         # TODO: Add tolerance?
-        if z_new < self.min_image[x_new, y_new]:
-            # Terminate, but return the normalized observation (which might be < -1.0)
+
+        z_opt = self.optimal_height[x_new, y_new]
+        z_min = self.min_image[x_new, y_new]
+
+        # 1. Above or exactly at optimal height (Safe Zone)
+        if z_new >= z_opt:
+            reward = 10.0 - (z_new - z_opt)
+            
+        # 2. Below optimal height but above crash boundary (Danger Zone)
+        elif z_new > z_min:
+            # Calculate how far we are between min_image (0.0) and optimal_height (1.0)
+            # Since optimal_height = min_image + height_offset_reward, the denominator is just height_offset_reward
+            fraction = (z_new - z_min) / self.height_offset_reward
+            
+            # Drops immediately near 0 just below z_opt, scales linearly down to -100 near z_min
+            reward = -100.0 * (1.0 - fraction)
+            
+        # 3. At or below min_image (Crash Zone)
+        else:
             return self._get_obs(), -100.0, True, False, self._get_info()
 
-        # TODO: Base reward should be set by variable
-        reward = 10.0 - (z_new - self.optimal_height[x_new, y_new])
+
+        # if z_new < self.min_image[x_new, y_new]:
+        #     # Terminate, but return the normalized observation (which might be < -1.0)
+        #     return self._get_obs(), -100.0, True, False, self._get_info()
+
+        # # TODO: Base reward should be set by variable
+        # reward = 10.0 - (z_new - self.optimal_height[x_new, y_new])
 
         # Termination check
         if y_new == y_lim - 1:  # Check last row
