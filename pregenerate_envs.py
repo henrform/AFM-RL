@@ -4,9 +4,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from env.afm_env import AfmEnvironment
 
 CHUNK_SIZE = 16
-ANGLES = [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180]
-TXS = [0, 5, 10, 15, 20]
-TYS = [0, 5, 10, 15, 20]
+ANGLES = [i*10 for i in range(36)] #0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180]
+TXS = [i*3 for i in range(7)]
+TYS = [i*3 for i in range(7)]
 
 
 def chunk_list(lst: list, chunk_size: int) -> list[list]:
