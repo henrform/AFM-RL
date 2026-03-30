@@ -44,6 +44,59 @@ def jitter_penalty_difference(dz_window: np.ndarray, scale: float = 1.0) -> floa
 class AfmEnvironment(gym.Env):
     metadata = {'render.modes': ['human', 'rgb_array']}
 
+    def _load_view(self, view_idx: int) -> dict:
+        """
+        Ensure data for a selected view is loaded.
+
+        Directory-backed views use lazy metadata loading.
+        """
+        view = self.views[view_idx]
+
+        if view.get('source') != 'data_dir_lazy':
+            return view
+
+        if view['z_height_map'] is not None and view['min_image'] is not None:
+            return view
+
+        afm_images = np.load(view['afm_path'], mmap_mode='r')
+        with np.load(view['meta_path']) as meta:
+            z_height_map = meta['z_height_map']
+            min_image = meta['min_image']
+            z_bounds = meta['z_bounds']
+
+        z_min, z_max = z_bounds
+        optimal_height = gaussian_filter(min_image, sigma=self.sigma) + self.height_offset_reward
+
+        view['afm_images'] = afm_images
+        view['z_height_map'] = z_height_map
+        view['min_image'] = min_image
+        view['z_min'] = float(z_min)
+        view['z_max'] = float(z_max)
+        view['optimal_height'] = optimal_height
+        view['_z_map_start'] = z_height_map[0]
+        view['_z_map_step'] = z_height_map[1] - z_height_map[0]
+        view['_z_map_len_minus_1'] = len(z_height_map) - 1
+
+        return view
+
+    def _unload_view(self, view_idx: int) -> None:
+        """
+        Drop loaded arrays for a directory-backed lazy view.
+        """
+        view = self.views[view_idx]
+        if view.get('source') != 'data_dir_lazy':
+            return
+
+        view['afm_images'] = None
+        view['z_height_map'] = None
+        view['min_image'] = None
+        view['z_min'] = None
+        view['z_max'] = None
+        view['optimal_height'] = None
+        view['_z_map_start'] = None
+        view['_z_map_step'] = None
+        view['_z_map_len_minus_1'] = None
+
     def _compute_imgs(self, surface_path: str, params_path: str, i_platform: int = 0,
                       angle_deg: float = 0.0, tx: float = 0.0, ty: float = 0.0) -> tuple[AFMulator, np.ndarray]:
         """
@@ -133,6 +186,11 @@ class AfmEnvironment(gym.Env):
 
         os.makedirs(path, exist_ok=True)
         for i, view in enumerate(views_to_save):
+            if view.get('source') == 'data_dir_lazy':
+                # i indexes the selected subset only if surface_idx is used.
+                global_view_idx = self.views.index(view)
+                view = self._load_view(global_view_idx)
+
             sp = view.get('scan_params')
             if sp is not None:
                 ang = sp.get('angle_deg', 0.0)
@@ -167,12 +225,14 @@ class AfmEnvironment(gym.Env):
                  render_mode: Literal[None, 'human', 'rgb'] = None,
                  df_scale: float = 10.0,
                  dz_scale: float = 10.0,
-                 base_reward: float = 0.1,
-                 crash_reward: float = -1.0,
-                 termination_reward: float = 100.0,
+                 base_reward: float = 10.0,
+                 crash_reward: float = -100.0,
+                 termination_reward: float = 1000.0,
                  jitter_penalty_fn=None,
                  jitter_penalty_kwargs: dict | None = None,
                  jitter_window: int | None = None,
+                 include_image_in_info: bool = False,
+                 unload_view_on_reset: bool = True,
                  ) -> None:
         """
         Constructor.
@@ -241,6 +301,13 @@ class AfmEnvironment(gym.Env):
         jitter_window : int | None
             Number of most-recent timesteps passed to *jitter_penalty_fn*.
             ``None`` defaults to *num_historic_data*.
+        include_image_in_info : bool
+            If True, the current AFM image slice is included in the info dict
+            returned by step() under the key 'current_image'. This can be useful
+            for debugging and visualization but may slow down training.
+        unload_view_on_reset : bool
+            If True (default), unload the previously active lazy-loaded view when
+            switching to a different view in reset().
         """
         super().__init__()
 
@@ -256,6 +323,8 @@ class AfmEnvironment(gym.Env):
         self.jitter_penalty_fn = jitter_penalty_fn
         self.jitter_penalty_kwargs = jitter_penalty_kwargs if jitter_penalty_kwargs is not None else {}
         self.jitter_window = jitter_window if jitter_window is not None else num_historic_data
+        self.include_image_in_info = include_image_in_info
+        self.unload_view_on_reset = unload_view_on_reset
 
         # --- Load or compute views from all surface configs ---
         self.views = []
@@ -278,16 +347,30 @@ class AfmEnvironment(gym.Env):
                 if view_dirs:
                     for vd in view_dirs:
                         vpath = os.path.join(data_dir, vd)
-                        # True memory-map: OS pages in only the slices that are accessed
-                        afm_images = np.load(os.path.join(vpath, "afm_images.npy"), mmap_mode='r')
-                        meta = np.load(os.path.join(vpath, "meta.npz"))
-                        data = {
-                            'afm_images': afm_images,
-                            'z_height_map': meta['z_height_map'],
-                            'min_image': meta['min_image'],
-                            'z_bounds': meta['z_bounds'],
-                        }
-                        self.views.append(self._build_view_from_data(data, sigma))
+                        afm_path = os.path.join(vpath, "afm_images.npy")
+                        meta_path = os.path.join(vpath, "meta.npz")
+
+                        # Read shape from .npy header via memmap without loading array data.
+                        afm_images = np.load(afm_path, mmap_mode='r')
+                        x_lim = afm_images.shape[0]
+                        y_lim = afm_images.shape[1]
+
+                        self.views.append({
+                            'source': 'data_dir_lazy',
+                            'afm_path': afm_path,
+                            'meta_path': meta_path,
+                            'x_lim': x_lim,
+                            'y_lim': y_lim,
+                            'afm_images': None,
+                            'z_height_map': None,
+                            'min_image': None,
+                            'z_min': None,
+                            'z_max': None,
+                            'optimal_height': None,
+                            '_z_map_start': None,
+                            '_z_map_step': None,
+                            '_z_map_len_minus_1': None,
+                        })
                 else:
                     # Legacy format: flat view_*.npz files (no true memmap)
                     view_files = sorted([
@@ -331,8 +414,9 @@ class AfmEnvironment(gym.Env):
 
         # Store per-view spatial dimensions
         for view in self.views:
-            view['x_lim'] = view['afm_images'].shape[0]
-            view['y_lim'] = view['afm_images'].shape[1]
+            if 'x_lim' not in view or 'y_lim' not in view:
+                view['x_lim'] = view['afm_images'].shape[0]
+                view['y_lim'] = view['afm_images'].shape[1]
 
         # Initialize norm_bounds and spatial limits from first view
         # (updated per episode in reset to match the active view)
@@ -363,6 +447,7 @@ class AfmEnvironment(gym.Env):
         else:
             self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float64)
 
+        self.active_view_idx = None
         self.reset()
 
     def _build_view_from_data(self, data: np.lib.npyio.NpzFile | dict, sigma: int) -> dict:
@@ -546,7 +631,7 @@ class AfmEnvironment(gym.Env):
             "df": (self._df / self.df_scale).astype(np.float32)
         }
 
-    def _get_info(self):
+    def _get_info(self, include_image: bool = False) -> dict:
         """
         Compute auxiliary information for debugging.
 
@@ -554,11 +639,14 @@ class AfmEnvironment(gym.Env):
         -------
             dict : z height and corresponding index
         """
-        return {
+        info = {
             "z": self.z_start,
             "z_i": self.z_start_index,
-            "generated_image": self.generated_image,
         }
+        if include_image:
+            info["generated_image"] = self.generated_image
+
+        return info
 
     # TODO: Randomize start position and rotation. Maybe also switch between different surfaces?
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[ObsType, dict[str, Any]]:
@@ -586,7 +674,11 @@ class AfmEnvironment(gym.Env):
 
         # Randomly sample a view for this episode
         view_idx = np.random.randint(len(self.views))
-        view = self.views[view_idx]
+
+        if self.unload_view_on_reset and self.active_view_idx is not None and self.active_view_idx != view_idx:
+            self._unload_view(self.active_view_idx)
+
+        view = self._load_view(view_idx)
         self.active_view_idx = view_idx
 
         # Set active view data as instance attributes for use in step/obs
@@ -621,7 +713,7 @@ class AfmEnvironment(gym.Env):
         self.generated_image[:] = np.nan
         self.generated_image[0, 0] = self._get_interpolated_df(0, 0, self.z_start)
 
-        return self._get_obs(), self._get_info()
+        return self._get_obs(), self._get_info(include_image=self.include_image_in_info)
 
     def _insert_into_array(self, array: np.ndarray, data_point):
         """
@@ -653,7 +745,7 @@ class AfmEnvironment(gym.Env):
             tuple: (observation, reward, terminated, truncated, info)
         """
         if self.terminated:
-            return self._get_obs(), 0.0, True, False, self._get_info()
+            return self._get_obs(), 0.0, True, False, self._get_info(include_image=self.include_image_in_info)
 
         x_lim = self._x_lim
         y_lim = self._y_lim
@@ -746,7 +838,7 @@ class AfmEnvironment(gym.Env):
 
         # 3. At or below min_image (Crash Zone)
         else:
-            return self._get_obs(), self.crash_reward, True, False, self._get_info()
+            return self._get_obs(), self.crash_reward, True, False, self._get_info(include_image=self.include_image_in_info)
 
         # Apply jitter penalty
         if self.jitter_penalty_fn is not None:
@@ -761,4 +853,4 @@ class AfmEnvironment(gym.Env):
                 self.terminated = True
                 reward += self.termination_reward
 
-        return self._get_obs(), reward, self.terminated, False, self._get_info()
+        return self._get_obs(), reward, self.terminated, False, self._get_info(include_image=self.include_image_in_info)
