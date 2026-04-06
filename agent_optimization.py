@@ -153,7 +153,7 @@ def objective(trial):
     # Train the Model
     try:
         model.learn(
-            total_timesteps=10_000_000,
+            total_timesteps=7_500_000,
             callback=callbacks,
             tb_log_name=f"trial_{trial.number}"
         )
@@ -204,7 +204,7 @@ if __name__ == "__main__":
         storage=storage,
         load_if_exists=True,
         direction="maximize",
-        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=3),
+        pruner=MedianPruner(n_startup_trials=15, n_warmup_steps=6),
     )
 
     max_trials_callback = MaxTrialsCallback(64)
