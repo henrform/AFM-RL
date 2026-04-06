@@ -30,6 +30,11 @@ STUDY_NAME = "sac_afm_optimization"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--db_url", type=str, default=DB_URL, help="PostgreSQL connection string for the Optuna study storage")
+parser.add_argument(
+    "--enqueue",
+    action="store_true",
+    help="If set, enqueue promising initial parameters before optimization",
+)
 
 def make_env(num_historic_data, reward_exponent, rank=0):
     """Utility to create the environment with trial-specific parameters."""
@@ -75,7 +80,7 @@ def objective(trial):
     """The Optuna objective function executed for each trial."""
     
     # 1. Sample Environment Parameters
-    num_historic_data = trial.suggest_int("num_historic_data", 10, 100)
+    num_historic_data = trial.suggest_int("num_historic_data", 20, 100)
     reward_exponent = trial.suggest_float("reward_exponent", 1.0, 2.0)
 
     # 2. Sample SAC Hyperparameters
@@ -92,7 +97,7 @@ def objective(trial):
 
     # 4. Create the Evaluation Environment (Single env for reliable testing)
     eval_env = DummyVecEnv([make_env(num_historic_data, reward_exponent, 99)])
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10., training=False)
+    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10., training=False)
     # Sync normalization stats from train to eval
     eval_env.obs_rms = vec_train_env.obs_rms
 
@@ -132,7 +137,7 @@ def objective(trial):
         trial, 
         best_model_save_path=os.path.join(trial_dir, "best_model"),
         log_path=None, 
-        eval_freq=max(500000 // n_envs, 1) # Adjust for n_envs
+        eval_freq=max(250000 // n_envs, 1) # Adjust for n_envs
     )
 
     checkpoint_callback = CheckpointCallback(
@@ -180,10 +185,10 @@ if __name__ == "__main__":
     print(f"Connecting to Optuna Database at: {args.db_url.split('@')[-1]}")
     
     storage = RDBStorage(
-        url=DB_URL,
+        url=args.db_url,
         engine_kwargs={
-            "pool_size": 1,           # Only keep 1 connection open per worker
-            "max_overflow": 0,        # Never open extra connections
+            "pool_size": 2,           # Only keep 1 connection open per worker
+            "max_overflow": 2,        # Never open extra connections
             "pool_recycle": 3600,     # Refresh connection every hour
         }
     )
@@ -194,13 +199,29 @@ if __name__ == "__main__":
         storage=storage,
         load_if_exists=True,
         direction="maximize",
-        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=5),
+        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=3),
     )
 
     max_trials_callback = MaxTrialsCallback(64)
+    try:
+        current_best = study.best_value
+    except ValueError:
+        current_best = "None (No completed trials yet)"
 
-    print(f"Starting optimization. Current best value: {study.best_value if len(study.trials) > 0 else 'None'}")
+    print(f"Starting optimization. Current best value: {current_best}")
 
+    promising_params = {
+        "num_historic_data": 40, # Use your actual successful values here
+        "reward_exponent": 1.0,
+        "learning_rate": 0.0003,
+        "batch_size": 256,
+        "gamma": 0.99,
+        "tau": 0.005,
+    }
+
+    if args.enqueue:
+        study.enqueue_trial(promising_params)
+    
     study.optimize(objective, callbacks=[max_trials_callback])
 
     print("Optimization finished!")
