@@ -157,8 +157,10 @@ def objective(trial):
             callback=callbacks,
             tb_log_name=f"trial_{trial.number}"
         )
+    except optuna.exceptions.StorageInternalError:
+        print("Database connection lost. Check your VPN or Neon status.")
+        raise
     except Exception as e:
-        # Catch unexpected errors (like OOM or nan actions) and fail the trial gracefully
         print(f"Trial failed due to: {e}")
         raise optuna.exceptions.TrialPruned()
 
@@ -186,10 +188,13 @@ if __name__ == "__main__":
     
     storage = RDBStorage(
         url=args.db_url,
+        heartbeat_interval=60,
+        grace_period=120,
         engine_kwargs={
-            "pool_size": 2,           # Only keep 1 connection open per worker
-            "max_overflow": 2,        # Never open extra connections
-            "pool_recycle": 3600,     # Refresh connection every hour
+            "pool_size": 2,
+            "max_overflow": 2,
+            "pool_recycle": 280,
+            "pool_pre_ping": True,
         }
     )
 
