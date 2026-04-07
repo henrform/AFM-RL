@@ -65,15 +65,29 @@ class TrialEvalCallback(EvalCallback):
         self.is_pruned = False
 
     def _on_step(self) -> bool:
+        # Record the current best reward BEFORE the evaluation step
+        old_best_reward = self.best_mean_reward
+
+        # Run the parent's step (handles eval, updates best_mean_reward, saves best_model.zip)
         continue_training = super()._on_step()
+
+        # If the high score increased, save the VecNormalize stats to match
+        if self.best_mean_reward > old_best_reward:
+            if self.best_model_save_path is not None:
+                vec_path = os.path.join(self.best_model_save_path, "best_vec_normalize.pkl")
+                
+                if isinstance(self.training_env, VecNormalize):
+                    self.training_env.save(vec_path)
+
+        # Handle Optuna reporting and pruning
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
-            # Report the mean reward to Optuna
             self.trial.report(self.last_mean_reward, self.eval_idx)
             self.eval_idx += 1
-            # Check if Optuna wants to prune this trial
+            
             if self.trial.should_prune():
                 self.is_pruned = True
                 return False
+                
         return continue_training
 
 def objective(trial):
@@ -144,7 +158,8 @@ def objective(trial):
         trial, 
         best_model_save_path=os.path.join(trial_dir, "best_model"),
         log_path=None, 
-        eval_freq=max(250000 // n_envs, 1) # Adjust for n_envs
+        eval_freq=max(250000 // n_envs, 1),
+        n_eval_episodes=25
     )
 
     # checkpoint_callback = CheckpointCallback(
