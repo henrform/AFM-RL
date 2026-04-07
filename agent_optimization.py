@@ -220,7 +220,7 @@ if __name__ == "__main__":
         storage=storage,
         load_if_exists=True,
         direction="maximize",
-        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=6),
+        pruner=MedianPruner(n_startup_trials=0, n_warmup_steps=6, n_min_trials=5),
     )
 
     max_trials_callback = MaxTrialsCallback(80)
