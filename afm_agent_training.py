@@ -30,6 +30,7 @@ parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning 
 parser.add_argument("--batch_size", type=int, default=256, help="Batch size for training")
 parser.add_argument("--norm_obs", action=argparse.BooleanOptionalAction, default=True, help="Normalize observations")
 parser.add_argument("--norm_reward", action=argparse.BooleanOptionalAction, default=True, help="Normalize rewards")
+parser.add_argument("--n_steps", type=int, default=2048, help="PPO only: number of steps per environment per update")
 args = parser.parse_args()
 
 if args.use_cnn and args.num_historic_data < 64:
@@ -193,6 +194,7 @@ else:
         policy_kwargs=policy_kwargs,
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
+        n_steps=args.n_steps,
         clip_range=args.epsilon,
         ent_coef=0.01,
         device="cuda",
