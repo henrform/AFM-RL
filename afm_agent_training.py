@@ -1,11 +1,10 @@
 from env.afm_env import AfmEnvironment
 
 import argparse
-import tqdm
-from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, CallbackList
 from stable_baselines3 import SAC, PPO
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 import os
 import datetime
 from torch.nn import ReLU
@@ -17,6 +16,7 @@ parser.add_argument("--df_scale", type=float, default=10.0, help="Divisor for df
 parser.add_argument("--dz_scale", type=float, default=10.0, help="Divisor for dz observations")
 parser.add_argument("--algorithm", type=str, default="sac", choices=["sac", "ppo"], help="RL algorithm to train")
 parser.add_argument("--epsilon", type=float, default=0.2, help="PPO clip epsilon")
+parser.add_argument("--verbose", type=int, default=0, help="Verbosity level")
 args = parser.parse_args()
 
 TRAIN_BASE_DIR = "train_results"
@@ -35,23 +35,7 @@ ENVIRONMENT_DIRS = [
     "environments/pt_111_3v_1a",
 ]
 
-def make_env_gpu(rank=0):
-    def _init():
-        env = AfmEnvironment(
-            surface_configs=[{
-                'surface_path': "materials/pt_111_small_5row_missing.xyz",
-                'params_path': "materials/params_code.ini",
-            }],
-            num_historic_data=30,
-            num_actions=1,
-        )
-        env = Monitor(env)  #, filename=os.path.join("./logs", f"env_{rank}"))
-        return env
-
-    return _init
-
-
-def make_env_load(rank=0):
+def make_env_load():
     def _init():
         env = AfmEnvironment(
             surface_configs=[
@@ -73,9 +57,38 @@ def make_env_load(rank=0):
     return _init
 
 n_envs = 4
-env_arr = [make_env_load(i) for i in range(n_envs)]
+env_arr = [make_env_load() for _ in range(n_envs)]
 vec_env = DummyVecEnv(env_arr)
 vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.)
+
+eval_env = DummyVecEnv([make_env_load()])
+eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10., training=False)
+eval_env.obs_rms = vec_env.obs_rms
+
+class SyncedEvalCallback(EvalCallback):
+    def _on_step(self) -> bool:
+        if isinstance(self.eval_env, VecNormalize):
+            self.eval_env.obs_rms = self.model.get_vec_normalize_env().obs_rms
+
+        old_best_reward = self.best_mean_reward
+        continue_training = super()._on_step()
+
+        if self.best_mean_reward > old_best_reward:
+            vec_env_to_save = self.model.get_vec_normalize_env()
+            if vec_env_to_save is not None:
+                vec_env_to_save.save(os.path.join(self.best_model_save_path, "best_vecnormalize.pkl"))
+
+        return continue_training
+
+eval_callback = SyncedEvalCallback(
+    eval_env,
+    best_model_save_path=os.path.join(TRAIN_DIR, "best_model"),
+    log_path=os.path.join(TRAIN_DIR, "eval_logs"),
+    eval_freq=max(100_000 // n_envs, 1),
+    n_eval_episodes=50,
+    deterministic=True,
+    render=False,
+)
 
 policy_kwargs = dict(
     net_arch=args.net_arch,
@@ -86,7 +99,7 @@ if args.algorithm == "sac":
     model = SAC(
         "MultiInputPolicy",
         vec_env,
-        verbose=1,
+        verbose=args.verbose,
         tensorboard_log="./tensorboard_logs_final_envs_sac",
         policy_kwargs=policy_kwargs,
         gradient_steps=n_envs,
@@ -96,7 +109,7 @@ else:
     model = PPO(
         "MultiInputPolicy",
         vec_env,
-        verbose=1,
+        verbose=args.verbose,
         tensorboard_log="./tensorboard_logs_final_envs",
         policy_kwargs=policy_kwargs,
         clip_range=args.epsilon,
@@ -117,7 +130,7 @@ model.learn(
     log_interval=1,
     progress_bar=False,
     tb_log_name=model_name,#"sac_afm_env" + train_date,
-    callback=[checkpoint_callback],
+    callback=CallbackList([checkpoint_callback, eval_callback]),
 )
 model.save(os.path.join(TRAIN_DIR, "final_model"))
 vec_env.save(os.path.join(TRAIN_DIR, "vec_normalize.pkl"))
