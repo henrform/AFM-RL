@@ -1,6 +1,7 @@
 from env.afm_env import AfmEnvironment
 
 import argparse
+import json
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, CallbackList
 from stable_baselines3 import SAC, PPO
 from stable_baselines3.common.monitor import Monitor
@@ -10,14 +11,13 @@ import datetime
 from torch.nn import ReLU
 from torch import nn
 import torch
+from torch.utils.tensorboard import SummaryWriter
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.callbacks import BaseCallback
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--net_arch", type=int, nargs="+", default=[256, 256], help="Network architecture layer sizes")
 parser.add_argument("--num_historic_data", type=int, default=30, help="Number of historic data points")
-parser.add_argument("--df_scale", type=float, default=10.0, help="Divisor for df observations")
-parser.add_argument("--dz_scale", type=float, default=10.0, help="Divisor for dz observations")
 parser.add_argument("--algorithm", type=str, default="sac", choices=["sac", "ppo"], help="RL algorithm to train")
 parser.add_argument("--epsilon", type=float, default=0.2, help="PPO clip epsilon")
 parser.add_argument("--verbose", type=int, default=0, help="Verbosity level")
@@ -27,6 +27,9 @@ parser.add_argument("--n_envs", type=int, default=4, help="Number of parallel tr
 parser.add_argument("--callback_freq", type=int, default=10000, help="Evaluation and checkpoint frequency (in steps, before division by n_envs)")
 parser.add_argument("--reward_ceiling_offset_change_step", type=int, default=None, help="Number of steps after which to change reward_ceiling_offset")
 parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate for the optimizer")
+parser.add_argument("--batch_size", type=int, default=256, help="Batch size for training")
+parser.add_argument("--norm_obs", action=argparse.BooleanOptionalAction, default=True, help="Normalize observations")
+parser.add_argument("--norm_reward", action=argparse.BooleanOptionalAction, default=True, help="Normalize rewards")
 args = parser.parse_args()
 
 if args.use_cnn and args.num_historic_data < 64:
@@ -38,9 +41,14 @@ train_date = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 arch_str = "x".join(str(s) for s in args.net_arch)
 epsilon_suffix = f"_eps{args.epsilon}" if args.algorithm == "ppo" else ""
 cnn_suffix = "_cnn" if args.use_cnn else ""
-model_name = f"{args.algorithm}_afm_model_arch{arch_str}_hist{args.num_historic_data}_df{args.df_scale}_dz{args.dz_scale}_rc{args.reward_ceiling_offset}{epsilon_suffix}{cnn_suffix}_{train_date}"
+model_name = f"{args.algorithm}_arch{arch_str}_hist{args.num_historic_data}_rc{args.reward_ceiling_offset}{epsilon_suffix}{cnn_suffix}_{train_date}"
 TRAIN_DIR = os.path.join(TRAIN_BASE_DIR, model_name)
 os.makedirs(TRAIN_DIR, exist_ok=True)
+
+# Save training configuration
+config = vars(args)
+with open(os.path.join(TRAIN_DIR, "config.json"), "w") as f:
+    json.dump(config, f, indent=4)
 
 ENVIRONMENT_DIRS = [
     "environments/pt_111_1a",
@@ -57,8 +65,6 @@ def make_env_load():
             ],
             num_historic_data=args.num_historic_data,
             num_actions=1,
-            df_scale=args.df_scale,
-            dz_scale=args.dz_scale,
             base_reward=10,
             crash_reward=-100.0,
             sigma=2,
@@ -73,10 +79,10 @@ def make_env_load():
 n_envs = args.n_envs
 env_arr = [make_env_load() for _ in range(n_envs)]
 vec_env = DummyVecEnv(env_arr)
-vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.)
+vec_env = VecNormalize(vec_env, norm_obs=args.norm_obs, norm_reward=args.norm_reward, clip_obs=10.)
 
 eval_env = DummyVecEnv([make_env_load()])
-eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10., training=False)
+eval_env = VecNormalize(eval_env, norm_obs=args.norm_obs, norm_reward=False, clip_obs=10., training=False)
 eval_env.obs_rms = vec_env.obs_rms
 
 class RewardCeilingOffsetChangeCallback(BaseCallback):
@@ -131,6 +137,7 @@ class AfmCnnExtractor(BaseFeaturesExtractor):
         
         self.cnn = nn.Sequential(
             nn.Conv1d(2,   32,  kernel_size=8, stride=4),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Conv1d(32,  64,  kernel_size=4, stride=2),
             nn.ReLU(),
@@ -173,6 +180,7 @@ if args.algorithm == "sac":
         tensorboard_log="./tb_logs_sac_final",
         policy_kwargs=policy_kwargs,
         learning_rate=args.learning_rate,
+        batch_size=args.batch_size,
         gradient_steps=n_envs,
         device="cuda",
     )
@@ -184,6 +192,7 @@ else:
         tensorboard_log="./tb_logs_ppo_final",
         policy_kwargs=policy_kwargs,
         learning_rate=args.learning_rate,
+        batch_size=args.batch_size,
         clip_range=args.epsilon,
         ent_coef=0.01,
         device="cuda",
@@ -207,6 +216,12 @@ if args.reward_ceiling_offset_change_step is not None:
         verbose=args.verbose
     )
     callbacks.append(reward_ceiling_callback)
+
+tb_log_dir = model.tensorboard_log
+tb_writer = SummaryWriter(log_dir=os.path.join(tb_log_dir, model_name + "_1"))
+config_text = "\n".join(f"    {k}: {v}" for k, v in config.items())
+tb_writer.add_text("config", f"```\n{config_text}\n```", global_step=0)
+tb_writer.close()
 
 model.learn(
     total_timesteps=10000000,
