@@ -11,7 +11,6 @@ import datetime
 from torch.nn import ReLU
 from torch import nn
 import torch
-from torch.utils.tensorboard import SummaryWriter
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -85,6 +84,21 @@ vec_env = VecNormalize(vec_env, norm_obs=args.norm_obs, norm_reward=args.norm_re
 eval_env = DummyVecEnv([make_env_load()])
 eval_env = VecNormalize(eval_env, norm_obs=args.norm_obs, norm_reward=False, clip_obs=10., training=False)
 eval_env.obs_rms = vec_env.obs_rms
+
+class LogConfigCallback(BaseCallback):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self._logged = False
+
+    def _on_step(self) -> bool:
+        if not self._logged:
+            config_text = "\n".join(f"    {k}: {v}" for k, v in self.config.items())
+            self.logger.record("config", f"```\n{config_text}\n```", exclude="stdout")
+            self.logger.dump(self.num_timesteps)
+            self._logged = True
+        return True
+
 
 class RewardCeilingOffsetChangeCallback(BaseCallback):
     """Callback to change reward_ceiling_offset after a specified number of steps."""
@@ -208,7 +222,7 @@ checkpoint_callback = CheckpointCallback(
     save_vecnormalize=True,
 )
 
-callbacks = [checkpoint_callback, eval_callback]
+callbacks = [checkpoint_callback, eval_callback, LogConfigCallback(config)]
 
 # Add reward_ceiling_offset change callback if specified
 if args.reward_ceiling_offset_change_step is not None:
@@ -218,12 +232,6 @@ if args.reward_ceiling_offset_change_step is not None:
         verbose=args.verbose
     )
     callbacks.append(reward_ceiling_callback)
-
-tb_log_dir = model.tensorboard_log
-tb_writer = SummaryWriter(log_dir=os.path.join(tb_log_dir, model_name + "_1"))
-config_text = "\n".join(f"    {k}: {v}" for k, v in config.items())
-tb_writer.add_text("config", f"```\n{config_text}\n```", global_step=0)
-tb_writer.close()
 
 model.learn(
     total_timesteps=10000000,
