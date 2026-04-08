@@ -11,6 +11,7 @@ from torch.nn import ReLU
 from torch import nn
 import torch
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.callbacks import BaseCallback
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--net_arch", type=int, nargs="+", default=[256, 256], help="Network architecture layer sizes")
@@ -22,6 +23,10 @@ parser.add_argument("--epsilon", type=float, default=0.2, help="PPO clip epsilon
 parser.add_argument("--verbose", type=int, default=0, help="Verbosity level")
 parser.add_argument("--use_cnn", action="store_true", help="Use CNN feature extractor")
 parser.add_argument("--reward_ceiling_offset", type=float, default=10.0, help="Vertical margin above optimal height for crash termination")
+parser.add_argument("--n_envs", type=int, default=4, help="Number of parallel training environments")
+parser.add_argument("--callback_freq", type=int, default=10000, help="Evaluation and checkpoint frequency (in steps, before division by n_envs)")
+parser.add_argument("--reward_ceiling_offset_change_step", type=int, default=None, help="Number of steps after which to change reward_ceiling_offset")
+parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate for the optimizer")
 args = parser.parse_args()
 
 if args.use_cnn and args.num_historic_data < 64:
@@ -59,14 +64,13 @@ def make_env_load():
             sigma=2,
             height_offset_reward=0.4,
             reward_exponent=1,
-            reward_ceiling_offset=args.reward_ceiling_offset,
         )
         env = Monitor(env)  #, filename=os.path.join("./logs", f"env_{rank}"))
         return env
 
     return _init
 
-n_envs = 4
+n_envs = args.n_envs
 env_arr = [make_env_load() for _ in range(n_envs)]
 vec_env = DummyVecEnv(env_arr)
 vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.)
@@ -74,6 +78,27 @@ vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.)
 eval_env = DummyVecEnv([make_env_load()])
 eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10., training=False)
 eval_env.obs_rms = vec_env.obs_rms
+
+class RewardCeilingOffsetChangeCallback(BaseCallback):
+    """Callback to change reward_ceiling_offset after a specified number of steps."""
+    def __init__(self, change_step, new_value, verbose=0):
+        super().__init__(verbose)
+        self.change_step = change_step
+        self.new_value = new_value
+        self.already_changed = False
+
+    def _on_step(self) -> bool:
+        if not self.already_changed and self.num_timesteps >= self.change_step:
+            if self.verbose > 0:
+                print(f"\nChanging reward_ceiling_offset to {self.new_value} at step {self.num_timesteps}")
+            
+            # Change in all training environments
+            for env in self.model.env.envs:
+                env.env.reward_ceiling_offset = self.new_value
+            
+            self.already_changed = True
+        return True
+
 
 class SyncedEvalCallback(EvalCallback):
     def _on_step(self) -> bool:
@@ -94,8 +119,8 @@ eval_callback = SyncedEvalCallback(
     eval_env,
     best_model_save_path=os.path.join(TRAIN_DIR, "best_model"),
     log_path=os.path.join(TRAIN_DIR, "eval_logs"),
-    eval_freq=max(10_000 // n_envs, 1),
-    n_eval_episodes=15,
+    eval_freq=args.callback_freq // n_envs,
+    n_eval_episodes=20,
     deterministic=True,
     render=False,
 )
@@ -147,6 +172,7 @@ if args.algorithm == "sac":
         verbose=args.verbose,
         tensorboard_log="./tb_logs_sac_final",
         policy_kwargs=policy_kwargs,
+        learning_rate=args.learning_rate,
         gradient_steps=n_envs,
         device="cuda",
     )
@@ -155,27 +181,39 @@ else:
         "MultiInputPolicy",
         vec_env,
         verbose=args.verbose,
-        tensorboard_log="./tensorboard_logs_final_envs",
+        tensorboard_log="./tb_logs_ppo_final",
         policy_kwargs=policy_kwargs,
+        learning_rate=args.learning_rate,
         clip_range=args.epsilon,
         ent_coef=0.01,
         device="cuda",
     )
 
 checkpoint_callback = CheckpointCallback(
-    save_freq=10000 // n_envs,
+    save_freq=args.callback_freq // n_envs,
     save_path=os.path.join(TRAIN_DIR, "models"),
     name_prefix=model_name,
     save_replay_buffer=False,
     save_vecnormalize=True,
 )
 
+callbacks = [checkpoint_callback, eval_callback]
+
+# Add reward_ceiling_offset change callback if specified
+if args.reward_ceiling_offset_change_step is not None:
+    reward_ceiling_callback = RewardCeilingOffsetChangeCallback(
+        change_step=args.reward_ceiling_offset_change_step,
+        new_value=args.reward_ceiling_offset,
+        verbose=args.verbose
+    )
+    callbacks.append(reward_ceiling_callback)
+
 model.learn(
     total_timesteps=10000000,
     log_interval=1,
     progress_bar=False,
     tb_log_name=model_name,#"sac_afm_env" + train_date,
-    callback=CallbackList([checkpoint_callback, eval_callback]),
+    callback=CallbackList(callbacks),
 )
 model.save(os.path.join(TRAIN_DIR, "final_model"))
 vec_env.save(os.path.join(TRAIN_DIR, "vec_normalize.pkl"))
