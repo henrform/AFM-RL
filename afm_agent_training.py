@@ -163,7 +163,7 @@ else:
     )
 
 checkpoint_callback = CheckpointCallback(
-    save_freq=50000 // n_envs,
+    save_freq=10000 // n_envs,
     save_path=os.path.join(TRAIN_DIR, "models"),
     name_prefix=model_name,
     save_replay_buffer=False,
