@@ -8,6 +8,9 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 import os
 import datetime
 from torch.nn import ReLU
+from torch import nn
+import torch
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--net_arch", type=int, nargs="+", default=[256, 256], help="Network architecture layer sizes")
@@ -17,14 +20,19 @@ parser.add_argument("--dz_scale", type=float, default=10.0, help="Divisor for dz
 parser.add_argument("--algorithm", type=str, default="sac", choices=["sac", "ppo"], help="RL algorithm to train")
 parser.add_argument("--epsilon", type=float, default=0.2, help="PPO clip epsilon")
 parser.add_argument("--verbose", type=int, default=0, help="Verbosity level")
+parser.add_argument("--use_cnn", action="store_true", help="Use CNN feature extractor")
 args = parser.parse_args()
+
+if args.use_cnn and args.num_historic_data < 64:
+    raise ValueError(f"CNN requires at least 64 num_historic_data points, got {args.num_historic_data}")
 
 TRAIN_BASE_DIR = "train_results"
 train_date = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 arch_str = "x".join(str(s) for s in args.net_arch)
 epsilon_suffix = f"_eps{args.epsilon}" if args.algorithm == "ppo" else ""
-model_name = f"{args.algorithm}_afm_model_arch{arch_str}_hist{args.num_historic_data}_df{args.df_scale}_dz{args.dz_scale}{epsilon_suffix}_{train_date}"
+cnn_suffix = "_cnn" if args.use_cnn else ""
+model_name = f"{args.algorithm}_afm_model_arch{arch_str}_hist{args.num_historic_data}_df{args.df_scale}_dz{args.dz_scale}{epsilon_suffix}{cnn_suffix}_{train_date}"
 TRAIN_DIR = os.path.join(TRAIN_BASE_DIR, model_name)
 os.makedirs(TRAIN_DIR, exist_ok=True)
 
@@ -90,17 +98,50 @@ eval_callback = SyncedEvalCallback(
     render=False,
 )
 
+class AfmCnnExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space, features_dim=256):
+        super().__init__(observation_space, features_dim)
+        # observation is a dict with df, dz, x, y each of shape (num_historic_data,)
+        self.cnn = nn.Sequential(
+            nn.Conv1d(4,   32,  kernel_size=8, stride=4),  # → 99
+            nn.ReLU(),
+            nn.Conv1d(32,  64,  kernel_size=4, stride=2),  # → 48
+            nn.ReLU(),
+            nn.Conv1d(64,  128, kernel_size=4, stride=2),  # → 23
+            nn.ReLU(),
+            nn.Conv1d(128, 128, kernel_size=4, stride=2),  # → 10
+            nn.ReLU(),
+            nn.Flatten(),                                   # → 1280
+        )
+        # Compute flatten dim using a dummy input
+        num_historic_data = observation_space["df"].shape[0]
+        with torch.no_grad():
+            sample = torch.zeros(1, 4, num_historic_data)
+            n_flatten = self.cnn(sample).shape[1]
+        self.linear = nn.Sequential(
+            nn.Linear(n_flatten, features_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, obs):
+        # Stack dict entries into (batch, channels, timesteps)
+        x = torch.stack([obs["df"], obs["dz"], obs["x"], obs["y"]], dim=1)
+        return self.linear(self.cnn(x))
+
 policy_kwargs = dict(
     net_arch=args.net_arch,
     activation_fn=ReLU,
 )
+if args.use_cnn:
+    policy_kwargs["features_extractor_class"] = AfmCnnExtractor
+    policy_kwargs["features_extractor_kwargs"] = dict(features_dim=160)
 
 if args.algorithm == "sac":
     model = SAC(
         "MultiInputPolicy",
         vec_env,
         verbose=args.verbose,
-        tensorboard_log="./tensorboard_logs_final_envs_sac",
+        tensorboard_log="./tb_logs_sac_final",
         policy_kwargs=policy_kwargs,
         gradient_steps=n_envs,
         device="cuda",
