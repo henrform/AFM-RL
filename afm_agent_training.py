@@ -31,6 +31,7 @@ parser.add_argument("--norm_obs", action=argparse.BooleanOptionalAction, default
 parser.add_argument("--norm_reward", action=argparse.BooleanOptionalAction, default=True, help="Normalize rewards")
 parser.add_argument("--n_steps", type=int, default=2048, help="PPO only: number of steps per environment per update")
 parser.add_argument("--gradient_steps", type=int, default=None, help="SAC only: number of gradient steps per update (default: n_envs)")
+parser.add_argument("--tau", type=float, default=0.005, help="SAC only: target network update coefficient")
 args = parser.parse_args()
 
 if args.use_cnn and args.num_historic_data < 64:
@@ -199,6 +200,7 @@ if args.algorithm == "sac":
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
         gradient_steps=gradient_steps,
+        tau=args.tau,
         device="cuda",
     )
 else:
