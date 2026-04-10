@@ -203,8 +203,8 @@ if args.use_cnn:
 if args.checkpoint_model is not None:
     print(f"Loading model from checkpoint: {args.checkpoint_model}")
     ModelClass = SAC if args.algorithm == "sac" else PPO
-    model = ModelClass.load(args.checkpoint_model, env=vec_env, device="cuda")
-    # Override hyperparams that may differ from the checkpoint
+    tb_log_dir = "./tb_logs_sac_final" if args.algorithm == "sac" else "./tb_logs_ppo_final"
+    model = ModelClass.load(args.checkpoint_model, env=vec_env, device="cuda", tensorboard_log=tb_log_dir)
     model.learning_rate = constant_fn(args.learning_rate)
     model.batch_size = args.batch_size
     if args.algorithm == "sac":
@@ -213,6 +213,7 @@ if args.checkpoint_model is not None:
     else:
         model.clip_range = constant_fn(args.epsilon)
         model.ent_coef = args.ent_coef
+        model.n_steps = args.n_steps
 elif args.algorithm == "sac":
     gradient_steps = args.gradient_steps if args.gradient_steps is not None else n_envs
     model = SAC(
