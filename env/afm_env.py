@@ -59,9 +59,22 @@ class AfmEnvironment(gym.Env):
 
     def _load_view(self, view_idx: int) -> dict:
         """
-        Ensure data for a selected view is loaded.
+        Ensure data for a selected view is loaded into memory.
 
-        Directory-backed views use lazy metadata loading.
+        For directory-backed lazy views, memory-maps the AFM image stack and
+        loads the small metadata arrays (height map, min image, z bounds) on
+        first access, then computes the smoothed optimal-height surface.
+        Already-loaded or eager views are returned unchanged.
+
+        Parameters
+        ----------
+        view_idx : int
+            Index into ``self.views`` of the view to load.
+
+        Returns
+        -------
+        dict
+            The (now populated) view dict from ``self.views``.
         """
         view = self.views[view_idx]
 
@@ -95,6 +108,14 @@ class AfmEnvironment(gym.Env):
     def _unload_view(self, view_idx: int) -> None:
         """
         Drop loaded arrays for a directory-backed lazy view.
+
+        Resets the view's image, metadata, and derived fields back to ``None``
+        so memory can be reclaimed. No-op for eagerly loaded views.
+
+        Parameters
+        ----------
+        view_idx : int
+            Index into ``self.views`` of the view to unload.
         """
         view = self.views[view_idx]
         if view.get('source') != 'data_dir_lazy':
@@ -113,23 +134,35 @@ class AfmEnvironment(gym.Env):
     def _compute_imgs(self, surface_path: str, params_path: str, i_platform: int = 0,
                       angle_deg: float = 0.0, tx: float = 0.0, ty: float = 0.0) -> tuple[AFMulator, np.ndarray]:
         """
-        Generates AFM images with ppafm
+        Generate AFM images with ppafm for a (rotated, translated) surface.
+
+        Rotates the atom positions and grid vectors by ``angle_deg`` around z,
+        then translates by ``(tx, ty)`` before running the AFMulator. The
+        returned image stack has its second and third axes reversed so it is
+        indexed as ``(x, y, z)`` in scan coordinates.
 
         Parameters
         ----------
         surface_path : str
-            Path to a .xyz file containing the surface
+            Path to a .xyz file containing the surface.
         params_path : str
-            Path to a .ini file containing the parameters for the simulation
+            Path to a .ini file containing the parameters for the simulation.
         i_platform : int
-            Index of OpenCL device
+            Index of OpenCL device.
+        angle_deg : float
+            In-plane rotation of the surface in degrees.
+        tx : float
+            Translation along x applied after rotation.
+        ty : float
+            Translation along y applied after rotation.
 
         Returns
         -------
         AFMulator
-            AFMulator object used to generate images
+            AFMulator object used to generate images.
         np.ndarray
-            Generated images. The second and third axis are already reversed.
+            Generated images (float16). The second and third axes are already
+            reversed.
         """
         init_env(i_platform=i_platform)
 
@@ -478,9 +511,27 @@ class AfmEnvironment(gym.Env):
 
     def _build_view_from_data(self, data: np.lib.npyio.NpzFile | dict, sigma: int) -> dict:
         """
-        Build a view dict from loaded data (NpzFile or plain dict).
-        When afm_images is already float16 (e.g. from a memory-mapped .npy),
-        copy=False avoids an unnecessary allocation.
+        Build a view dict from previously saved data.
+
+        Extracts the AFM image stack, z-height map, min-image, and z bounds,
+        and precomputes the smoothed optimal-height surface along with cached
+        z-map indexing helpers.
+
+        Parameters
+        ----------
+        data : np.lib.npyio.NpzFile | dict
+            Mapping-like object containing ``afm_images``, ``z_height_map``,
+            ``min_image``, and ``z_bounds``. When ``afm_images`` is already
+            float16 (e.g. memory-mapped from ``.npy``), ``copy=False`` avoids
+            an unnecessary allocation.
+        sigma : int
+            Standard deviation for Gaussian smoothing of ``min_image`` used to
+            derive the optimal-height surface.
+
+        Returns
+        -------
+        dict
+            A view dict ready to be appended to ``self.views``.
         """
         afm_images = data['afm_images'].astype(np.float16, copy=False)
         z_height_map = data['z_height_map']
@@ -506,6 +557,33 @@ class AfmEnvironment(gym.Env):
                       sigma: int, angle_deg: float, tx: float, ty: float) -> dict:
         """
         Compute a single view from scratch and return a view dict.
+
+        Runs the AFMulator for the given rotation/translation, extracts the
+        highest local-minimum z-slice per pixel to form ``min_image``, and
+        derives the smoothed optimal-height surface.
+
+        Parameters
+        ----------
+        surface_path : str
+            Path to the .xyz surface file.
+        params_path : str
+            Path to the ppafm parameters .ini file.
+        i_platform : int
+            Index of OpenCL device.
+        sigma : int
+            Standard deviation of the Gaussian smoothing applied to
+            ``min_image`` to produce the optimal-height surface.
+        angle_deg : float
+            In-plane rotation of the surface in degrees.
+        tx : float
+            Translation along x applied after rotation.
+        ty : float
+            Translation along y applied after rotation.
+
+        Returns
+        -------
+        dict
+            A view dict including the scan parameters that produced it.
         """
         afmulator, afm_images = self._compute_imgs(
             surface_path, params_path, i_platform, angle_deg, tx, ty
@@ -555,8 +633,21 @@ class AfmEnvironment(gym.Env):
 
     def _normalize(self, value: np.ndarray | float, key: str) -> np.ndarray | float:
         """
-        Normalize a physical value to range [-1, 1].
-        Formula: 2 * (x - min) / (max - min) - 1
+        Normalize a physical value to the range [-1, 1].
+
+        Uses ``self.norm_bounds[key]`` via ``2 * (x - min) / (max - min) - 1``.
+
+        Parameters
+        ----------
+        value : np.ndarray | float
+            Physical value(s) to normalize.
+        key : str
+            Key into ``self.norm_bounds`` (e.g. ``'x'`` or ``'y'``).
+
+        Returns
+        -------
+        np.ndarray | float
+            Normalized value(s) in [-1, 1].
         """
         min_v, max_v = self.norm_bounds[key]
         return 2.0 * ((value - min_v) / (max_v - min_v)) - 1.0
@@ -564,11 +655,21 @@ class AfmEnvironment(gym.Env):
     def denormalize_observation(self, obs_dict: dict) -> dict:
         """
         Convert a normalized observation dictionary back to physical units.
-        Useful for plotting and interpretation.
 
-        x, y: Inverse of ``_normalize`` (using active view's norm_bounds).
-        df:   Multiplied by ``df_scale`` (inverse of division in ``_get_obs``).
-        dz:   Multiplied by ``dz_scale`` (inverse of division in ``_get_obs``).
+        Useful for plotting and interpretation. Applies the inverse of
+        ``_normalize`` (using the active view's ``norm_bounds``) to ``x``/``y``,
+        and multiplies ``df`` / ``dz`` by ``df_scale`` / ``dz_scale``
+        respectively. Unknown keys are passed through unchanged.
+
+        Parameters
+        ----------
+        obs_dict : dict
+            Normalized observation dict as produced by ``_get_obs``.
+
+        Returns
+        -------
+        dict
+            Dictionary with the same keys in physical units.
         """
         physical_obs = {}
         for key, value in obs_dict.items():
@@ -585,53 +686,57 @@ class AfmEnvironment(gym.Env):
 
     def _get_closest_slice_index(self, z: float) -> np.int64:
         """
-        Returns the index of the slice closest to a given z height
+        Return the index of the z-slice closest to a given physical height.
 
         Parameters
         ----------
         z : float
-            Height of the desired slice
+            Physical height whose nearest slice index is requested.
 
         Returns
         -------
-        int : index of the closest slice
+        np.int64
+            Index into ``self.z_height_map`` of the closest slice.
         """
         return np.abs(self.z_height_map - z).argmin()
 
-    def _get_two_closest_z_planes(self, z):
+    def _get_two_closest_z_planes(self, z: float):
         """
-        Returns the indices of the two closest values in array to the given value.
+        Return the indices of the two z-planes closest to a given height.
 
         Parameters
         ----------
-        value : float
-            The target value
+        z : float
+            Target physical height.
 
         Returns
         -------
-        tuple : (int, int)
-            Indices of the two closest values in ascending order
+        np.ndarray
+            Length-2 array of indices into ``self.z_height_map`` in ascending
+            order.
         """
         return np.sort(np.argsort(np.abs(self.z_height_map - z))[0:2])
 
     def _get_interpolated_df(self, x: int, y: int, z: float):
         """
-        Interpolates a value at the given xy coordinates
-        for a specific height `z` using two closest z-planes.
+        Linearly interpolate df at ``(x, y, z)`` between the two closest z-planes.
+
+        Falls back to the value at the single closest plane when the two
+        bracketing planes coincide.
 
         Parameters
         ----------
         x : int
-            The x index
+            Pixel x index.
         y : int
-            The y index
+            Pixel y index.
         z : float
-            The z position at which the value needs to be interpolated.
+            Physical z position at which df is interpolated.
 
         Returns
         -------
         float
-            The interpolated value at the specified z-coordinate.
+            Interpolated df value at ``(x, y, z)``.
         """
         z1, z2 = self._get_two_closest_z_planes(z)
         denom = (self.z_height_map[z2] - self.z_height_map[z1])
@@ -643,12 +748,17 @@ class AfmEnvironment(gym.Env):
 
     def _get_obs(self):
         """
-        Convert internal state to observation format.
+        Convert internal state to the gym observation format.
+
+        Normalizes x/y history to [-1, 1] using the active view's bounds and
+        scales dz/df history by ``dz_scale`` / ``df_scale``.
 
         Returns
         -------
         dict
-            Observation dictionary with x and y position, difference to the starting height and change in frequency
+            Observation dict with keys ``x``, ``y`` (normalized positions),
+            ``dz`` (height change relative to start) and ``df`` (frequency
+            shift), each a length-``num_historic_data`` float32 array.
         """
         return {
             "x": self._normalize(self._x, 'x').astype(np.float32),
@@ -659,11 +769,20 @@ class AfmEnvironment(gym.Env):
 
     def _get_info(self, include_image: bool = False) -> dict:
         """
-        Compute auxiliary information for debugging.
+        Build the auxiliary info dict returned alongside observations.
+
+        Parameters
+        ----------
+        include_image : bool
+            If True, include the currently generated df image under
+            ``'generated_image'``. Can be useful for debugging / visualization
+            but adds overhead.
 
         Returns
         -------
-            dict : z height and corresponding index
+        dict
+            Contains the starting z height (``'z'``) and its slice index
+            (``'z_i'``), plus the generated image when requested.
         """
         info = {
             "z": self.z_start,
@@ -677,19 +796,25 @@ class AfmEnvironment(gym.Env):
     # TODO: Randomize start position and rotation. Maybe also switch between different surfaces?
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[ObsType, dict[str, Any]]:
         """
-        Resets the environment. Randomly selects a view from the available views
-        and initializes the agent state.
+        Reset the environment at the start of a new episode.
+
+        Randomly selects one of the loaded views, optionally unloading the
+        previously active lazy view, and initializes tip position, history
+        buffers, and the generated image. A random starting z height within
+        the scan window is drawn.
 
         Parameters
         ----------
         seed : int | None
-            Seed for the random number generator
+            Seed for the random number generator.
         options : dict[str, Any] | None
-            Options for super class
+            Options forwarded to the ``gym.Env`` super class.
 
         Returns
         -------
-
+        tuple
+            ``(observation, info)`` as produced by ``_get_obs`` and
+            ``_get_info``.
         """
         super().reset(seed=seed, options=options)
 
@@ -745,13 +870,27 @@ class AfmEnvironment(gym.Env):
         return self._get_obs(), self._get_info(include_image=self.include_image_in_info)
 
     def step(self, action) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
-        """Execute one timestep within the environment.
+        """
+        Execute one timestep within the environment.
 
-        Args:
-            action: The distance in Ångström that the tip should move.
+        Advances the tip along a raster-scan pattern, applies the vertical
+        action (directly or via the discrete action map), interpolates the
+        new df value, computes the reward based on the agent's position
+        relative to the optimal-height surface, and evaluates crash and
+        termination conditions.
 
-        Returns:
-            tuple: (observation, reward, terminated, truncated, info)
+        Parameters
+        ----------
+        action : np.ndarray | int
+            Vertical tip displacement in Ångström. For continuous action
+            spaces a length-1 array-like; for discrete spaces an integer
+            index into ``self._action_map``.
+
+        Returns
+        -------
+        tuple
+            ``(observation, reward, terminated, truncated, info)`` following
+            the Gymnasium step API.
         """
         if self.terminated:
             return self._get_obs(), 0.0, True, False, self._get_info(include_image=self.include_image_in_info)
