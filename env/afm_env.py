@@ -294,10 +294,7 @@ class AfmEnvironment(gym.Env):
               (list[dict]) with keys ``angle_deg``, ``tx``, ``ty`` for
               multiple rotated / translated views of the same surface.
             - ``data_dir_path`` (str): load pre-computed views from a
-              directory containing ``view_*/`` subdirectories (or legacy
-              ``view_*.npz`` files).
-            - ``data_file_path`` (str): load a single legacy ``.npz`` file
-              as one view.
+              directory containing ``view_*/`` subdirectories.
 
             Example::
 
@@ -393,67 +390,48 @@ class AfmEnvironment(gym.Env):
             start_idx = len(self.views)
 
             data_dir = config.get('data_dir_path')
-            data_file = config.get('data_file_path')
             surface = config.get('surface_path')
             params = config.get('params_path')
 
             if data_dir and os.path.isdir(data_dir):
-                # New format: view_*/ subdirectories, each with afm_images.npy + meta.npz
                 view_dirs = sorted([
                     d for d in os.listdir(data_dir)
                     if d.startswith("view_") and os.path.isdir(os.path.join(data_dir, d))
                 ])
-                if view_dirs:
-                    for vd in view_dirs:
-                        vpath = os.path.join(data_dir, vd)
-                        afm_path = os.path.join(vpath, "afm_images.npy")
-                        meta_path = os.path.join(vpath, "meta.npz")
+                if not view_dirs:
+                    raise ValueError(f"No view_*/ directories in {data_dir}")
+                for vd in view_dirs:
+                    vpath = os.path.join(data_dir, vd)
+                    afm_path = os.path.join(vpath, "afm_images.npy")
+                    meta_path = os.path.join(vpath, "meta.npz")
 
-                        # Read shape from .npy header via memmap without loading array data.
-                        afm_images = np.load(afm_path, mmap_mode='r')
-                        x_lim = afm_images.shape[0]
-                        y_lim = afm_images.shape[1]
+                    # Read shape from .npy header via memmap without loading array data.
+                    afm_images = np.load(afm_path, mmap_mode='r')
+                    x_lim = afm_images.shape[0]
+                    y_lim = afm_images.shape[1]
 
-                        self.views.append({
-                            'source': 'data_dir_lazy',
-                            'afm_path': afm_path,
-                            'meta_path': meta_path,
-                            'x_lim': x_lim,
-                            'y_lim': y_lim,
-                            'afm_images': None,
-                            'z_height_map': None,
-                            'min_image': None,
-                            'z_min': None,
-                            'z_max': None,
-                            'optimal_height': None,
-                            '_z_map_start': None,
-                            '_z_map_step': None,
-                            '_z_map_len_minus_1': None,
-                        })
-                else:
-                    # Legacy format: flat view_*.npz files (no true memmap)
-                    view_files = sorted([
-                        f for f in os.listdir(data_dir)
-                        if f.startswith("view_") and f.endswith(".npz")
-                    ])
-                    if not view_files:
-                        raise ValueError(
-                            f"No view_*/ directories or view_*.npz files in {data_dir}"
-                        )
-                    for vf in view_files:
-                        data = np.load(os.path.join(data_dir, vf))
-                        self.views.append(self._build_view_from_data(data, sigma))
-
-            elif data_file and os.path.exists(data_file):
-                # Legacy: single .npz file loaded as one view (no true memmap)
-                data = np.load(data_file)
-                self.views.append(self._build_view_from_data(data, sigma))
+                    self.views.append({
+                        'source': 'data_dir_lazy',
+                        'afm_path': afm_path,
+                        'meta_path': meta_path,
+                        'x_lim': x_lim,
+                        'y_lim': y_lim,
+                        'afm_images': None,
+                        'z_height_map': None,
+                        'min_image': None,
+                        'z_min': None,
+                        'z_max': None,
+                        'optimal_height': None,
+                        '_z_map_start': None,
+                        '_z_map_step': None,
+                        '_z_map_len_minus_1': None,
+                    })
 
             else:
                 if not surface or not params:
                     raise ValueError(
-                        "Each surface config must provide 'data_dir_path', "
-                        "'data_file_path', or both 'surface_path' and 'params_path'."
+                        "Each surface config must provide 'data_dir_path' "
+                        "or both 'surface_path' and 'params_path'."
                     )
 
                 scan_params = config.get('scan_params', [{'angle_deg': 0.0, 'tx': 0.0, 'ty': 0.0}])
@@ -508,50 +486,6 @@ class AfmEnvironment(gym.Env):
 
         self.active_view_idx = None
         self.reset()
-
-    def _build_view_from_data(self, data: np.lib.npyio.NpzFile | dict, sigma: int) -> dict:
-        """
-        Build a view dict from previously saved data.
-
-        Extracts the AFM image stack, z-height map, min-image, and z bounds,
-        and precomputes the smoothed optimal-height surface along with cached
-        z-map indexing helpers.
-
-        Parameters
-        ----------
-        data : np.lib.npyio.NpzFile | dict
-            Mapping-like object containing ``afm_images``, ``z_height_map``,
-            ``min_image``, and ``z_bounds``. When ``afm_images`` is already
-            float16 (e.g. memory-mapped from ``.npy``), ``copy=False`` avoids
-            an unnecessary allocation.
-        sigma : int
-            Standard deviation for Gaussian smoothing of ``min_image`` used to
-            derive the optimal-height surface.
-
-        Returns
-        -------
-        dict
-            A view dict ready to be appended to ``self.views``.
-        """
-        afm_images = data['afm_images'].astype(np.float16, copy=False)
-        z_height_map = data['z_height_map']
-        min_image = data['min_image']
-        z_min, z_max = data['z_bounds']
-
-        # TODO: Shift optimal height upwards?
-        optimal_height = gaussian_filter(min_image, sigma=sigma) + self.height_offset_reward
-
-        return {
-            'afm_images': afm_images,
-            'z_height_map': z_height_map,
-            'min_image': min_image,
-            'z_min': float(z_min),
-            'z_max': float(z_max),
-            'optimal_height': optimal_height,
-            '_z_map_start': z_height_map[0],
-            '_z_map_step': z_height_map[1] - z_height_map[0],
-            '_z_map_len_minus_1': len(z_height_map) - 1,
-        }
 
     def _compute_view(self, surface_path: str, params_path: str, i_platform: int,
                       sigma: int, angle_deg: float, tx: float, ty: float) -> dict:
