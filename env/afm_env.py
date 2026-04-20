@@ -14,25 +14,39 @@ import os
 import tempfile
 
 
-def jitter_penalty_difference(dz_window: np.ndarray, scale: float = 1.0) -> float:
+def jitter_penalty(
+    dz_window: np.ndarray,
+    df_window: np.ndarray,
+    x_window: np.ndarray,
+    y_window: np.ndarray,
+    scale: float = 1.0,
+) -> float:
     """
-    Jitter penalty based on total variation of dz over the window.
+    Penalty based on total variation of dz over the window.
     Sums the absolute differences between consecutive dz values, scaled by `scale`.
+    Pass a negative scale to subtract from the reward (penalize jitter).
 
     Usage
     -----
     env = AfmEnvironment(
         ...,
-        jitter_penalty_fn=jitter_penalty_difference,
-        jitter_penalty_kwargs={'scale': 0.5},
+        step_custom_reward_fns=[jitter_penalty],
+        step_custom_reward_kwargs=[{'scale': -0.5}],
     )
 
     Parameters
     ----------
     dz_window : np.ndarray
         Array of recent dz values.
+    df_window : np.ndarray
+        Array of recent df values.
+    x_window : np.ndarray
+        Array of recent x positions.
+    y_window : np.ndarray
+        Array of recent y positions.
     scale : float
         Multiplicative scale factor applied to the total variation.
+        Use a negative value to penalize jitter.
 
     Returns
     -------
@@ -230,9 +244,9 @@ class AfmEnvironment(gym.Env):
                  termination_reward: float = 1000.0,
                  reward_ceiling_offset: float = 10.0,
                  reward_exponent: float = 1.0,
-                 jitter_penalty_fn=None,
-                 jitter_penalty_kwargs: dict | None = None,
-                 jitter_window: int | None = None,
+                 step_custom_reward_fns: list | None = None,
+                 step_custom_reward_kwargs: list[dict] | None = None,
+                 step_custom_reward_windows: list[int] | None = None,
                  include_image_in_info: bool = False,
                  unload_view_on_reset: bool = True,
                  ) -> None:
@@ -302,16 +316,17 @@ class AfmEnvironment(gym.Env):
             Exponent used for the above-optimal-height penalty term in step().
             The reward in that region becomes
             ``base_reward - (z_new - z_opt) ** reward_exponent``.
-        jitter_penalty_fn : callable | None
-            ``fn(dz_window, **kwargs) -> float`` called each non-crash step.
-            The returned value is subtracted from the reward.
-            ``None`` (default) disables jitter penalization entirely.
-        jitter_penalty_kwargs : dict | None
-            Keyword arguments forwarded to *jitter_penalty_fn*.
-            Defaults to an empty dict.
-        jitter_window : int | None
-            Number of most-recent timesteps passed to *jitter_penalty_fn*.
-            ``None`` defaults to *num_historic_data*.
+        step_custom_reward_fns : list[callable] | None
+            List of ``fn(dz_window, df_window, x_window, y_window, **kwargs) -> float``
+            callables, each called every non-crash step. Their return values
+            are summed and added to the reward (use negative values to
+            penalize). ``None`` (default) disables custom rewards entirely.
+        step_custom_reward_kwargs : list[dict] | None
+            One kwargs dict per entry in *step_custom_reward_fns*.
+            Defaults to empty dicts.
+        step_custom_reward_windows : list[int] | None
+            One window size per entry in *step_custom_reward_fns*.
+            Each ``None`` entry defaults to *num_historic_data*.
         include_image_in_info : bool
             If True, the current AFM image slice is included in the info dict
             returned by step() under the key 'current_image'. This can be useful
@@ -333,9 +348,10 @@ class AfmEnvironment(gym.Env):
         self.termination_reward = termination_reward
         self.reward_ceiling_offset = reward_ceiling_offset
         self.reward_exponent = reward_exponent
-        self.jitter_penalty_fn = jitter_penalty_fn
-        self.jitter_penalty_kwargs = jitter_penalty_kwargs if jitter_penalty_kwargs is not None else {}
-        self.jitter_window = jitter_window if jitter_window is not None else num_historic_data
+        self.step_custom_reward_fns = step_custom_reward_fns or []
+        n = len(self.step_custom_reward_fns)
+        self.step_custom_reward_kwargs = step_custom_reward_kwargs if step_custom_reward_kwargs is not None else [{}] * n
+        self.step_custom_reward_windows = step_custom_reward_windows if step_custom_reward_windows is not None else [num_historic_data] * n
         self.include_image_in_info = include_image_in_info
         self.unload_view_on_reset = unload_view_on_reset
 
@@ -867,9 +883,9 @@ class AfmEnvironment(gym.Env):
             self.terminated = True
             return self._get_obs(), self.crash_reward, True, False, self._get_info(include_image=self.include_image_in_info)
 
-        # Apply jitter penalty
-        if self.jitter_penalty_fn is not None:
-            reward -= self.jitter_penalty_fn(self._dz[:self.jitter_window], **self.jitter_penalty_kwargs)
+        # Apply custom per-step rewards
+        for fn, kwargs, w in zip(self.step_custom_reward_fns, self.step_custom_reward_kwargs, self.step_custom_reward_windows):
+            reward += fn(self._dz[:w], self._df[:w], self._x[:w], self._y[:w], **kwargs)
 
         # Termination check
         if y_new == y_lim - 1:  # Check last row
